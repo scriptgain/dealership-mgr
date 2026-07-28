@@ -1,0 +1,579 @@
+<?php
+
+use App\Http\Controllers\Admin\CollectionController;
+use App\Http\Controllers\Admin\CustomerController;
+use App\Http\Controllers\Admin\DashboardController;
+use App\Http\Controllers\Admin\DiscountController;
+use App\Http\Controllers\Admin\OrderController;
+use App\Http\Controllers\Admin\AvailabilityController;
+use App\Http\Controllers\Admin\BookingTypeController;
+use App\Http\Controllers\Admin\CalendarConnectionController;
+use App\Http\Controllers\Admin\CalendarSettingsController;
+use App\Http\Controllers\Admin\PaymentSettingsController;
+use App\Http\Controllers\Admin\ProductController;
+use App\Http\Controllers\Admin\ProjectController;
+use App\Http\Controllers\Admin\CannedJobController;
+use App\Http\Controllers\Admin\InspectionController;
+use App\Http\Controllers\Admin\ServiceReminderController;
+use App\Http\Controllers\Admin\VehicleController;
+use App\Http\Controllers\Admin\QuoteController;
+use App\Http\Controllers\Admin\ServiceRequestController;
+use App\Http\Controllers\Admin\TicketController;
+use App\Http\Controllers\Admin\WorkOrderController;
+use App\Http\Controllers\CalendarFeedController;
+use App\Http\Controllers\Admin\ShippingController;
+use App\Http\Controllers\Admin\SpamProtectionController;
+use App\Http\Controllers\Admin\StorefrontSettingsController;
+use App\Http\Controllers\Admin\TaxController;
+use App\Http\Controllers\Admin\TemplateController;
+use App\Http\Controllers\Admin\ThemeController;
+use App\Http\Controllers\ApiTokenController;
+use App\Http\Controllers\AuditLogController;
+use App\Http\Controllers\Auth\AuthController;
+use App\Http\Controllers\BrandingController;
+use App\Http\Controllers\FaviconController;
+use App\Http\Controllers\FirewallController;
+use App\Http\Controllers\GeneralSettingsController;
+use App\Http\Controllers\HostSslController;
+use App\Http\Controllers\NotificationController;
+use App\Http\Controllers\PasswordController;
+use App\Http\Controllers\SetupController;
+use App\Http\Controllers\Shop\AccountController;
+use App\Http\Controllers\Shop\BookingController;
+use App\Http\Controllers\Shop\QuoteController as ShopQuoteController;
+use App\Http\Controllers\Shop\CartController;
+use App\Http\Controllers\Shop\CatalogController;
+use App\Http\Controllers\Shop\CheckoutController;
+use App\Http\Controllers\Shop\DocsController;
+use App\Http\Controllers\Shop\PaymentController;
+use App\Http\Controllers\Shop\ServiceRequestController as ServiceRequestIntakeController;
+use Illuminate\Routing\Middleware\ValidateSignature;
+use App\Http\Controllers\Shop\RobotsController;
+use App\Http\Controllers\Shop\SitemapController;
+use App\Http\Controllers\TwoFactorController;
+use App\Http\Controllers\UserController;
+use Illuminate\Support\Facades\Route;
+
+/*
+|--------------------------------------------------------------------------
+| DealershipMGR routes
+|--------------------------------------------------------------------------
+| Two halves, deliberately separated:
+|   - the public STOREFRONT at /            (name prefix "shop.")
+|   - the merchant ADMIN at /admin          (scaffold names kept unprefixed so
+|     every inherited settings view/controller from the -MGR scaffold keeps
+|     working untouched)
+*/
+
+// First-run setup wizard. Not behind 'auth': step 1 (create admin) runs as a
+// guest, step 2 (license) runs authed. Access is governed by EnsureSetup.
+Route::prefix('setup')->group(function () {
+    Route::get('/', [SetupController::class, 'index'])->name('setup.index');
+    Route::post('/admin', [SetupController::class, 'storeAdmin'])->name('setup.admin');
+    Route::post('/license', [SetupController::class, 'storeLicense'])->name('setup.license');
+});
+
+// Staff auth.
+Route::middleware('guest')->group(function () {
+    Route::get('/admin/login', [AuthController::class, 'show'])->name('login');
+    Route::post('/admin/login', [AuthController::class, 'login'])->middleware(['throttle:10,1', 'captcha:admin_login']);
+    // Developer quick login. The action 404s unless the request IP matches
+    // the dev_login_ip setting, so this route is gated, not just hidden.
+    Route::post('/admin/dev-login', [AuthController::class, 'devLogin'])->name('dev-login')->middleware('throttle:10,1');
+    // Staff demo personas (Merchant Admin / Staff). IP-gated inside the action
+    // and captcha-free, exactly like dev-login: a POST from any other address
+    // 404s.
+    Route::post('/admin/demo-login/{persona}', [AuthController::class, 'demoLoginStaff'])
+        ->name('demo-login.staff')->middleware('throttle:10,1');
+});
+Route::get('/magic/{user}', [AuthController::class, 'magic'])->name('magic-login')->middleware('signed');
+
+/*
+ * Per-staff calendar subscription feed. The unguessable token IS the credential
+ * (like a webcal subscription URL), so no session/auth — Apple/Google/Outlook
+ * fetch it unauthenticated. Served as text/calendar.
+ */
+Route::get('/calendar/feed/{token}.ics', [CalendarFeedController::class, 'feed'])->name('calendar.feed');
+Route::get('/2fa', [AuthController::class, 'challenge'])->name('2fa.challenge');
+Route::post('/2fa', [AuthController::class, 'challengeVerify'])->middleware('throttle:10,1');
+Route::post('/logout', [AuthController::class, 'logout'])->middleware('auth')->name('logout');
+
+// Brand favicon, accent-tinted from DB-driven branding (public — browsers fetch
+// it pre-login). Extension-less on purpose: CloudPanel nginx serves *.svg/*.png
+// as static files and 404s before reaching PHP.
+Route::get('/brand/favicon', [FaviconController::class, 'svg'])->name('favicon.svg');
+Route::get('/brand/favicon-png', [FaviconController::class, 'faviconPng'])->name('favicon.png');
+Route::get('/brand/favicon-apple', [FaviconController::class, 'appleIcon'])->name('favicon.apple');
+
+/*
+|--------------------------------------------------------------------------
+| SEO endpoints (public, unauthenticated)
+|--------------------------------------------------------------------------
+| robots.txt is dynamic so the staging noindex switch and the sitemap URL come
+| from DB settings. public/robots.txt must NOT exist, or nginx serves the
+| static file and never reaches PHP.
+*/
+Route::get('/robots.txt', RobotsController::class)->name('robots');
+Route::get('/sitemap.xml', [SitemapController::class, 'index'])->name('sitemap.index');
+Route::get('/sitemap-pages.xml', [SitemapController::class, 'pages'])->name('sitemap.pages');
+Route::get('/sitemap-products-{page}.xml', [SitemapController::class, 'products'])
+    ->whereNumber('page')->name('sitemap.products');
+Route::get('/sitemap-collections-{page}.xml', [SitemapController::class, 'collections'])
+    ->whereNumber('page')->name('sitemap.collections');
+
+/*
+|--------------------------------------------------------------------------
+| Storefront (public)
+|--------------------------------------------------------------------------
+*/
+Route::name('shop.')->group(function () {
+    Route::get('/', [CatalogController::class, 'home'])->name('home');
+
+    /*
+     * Vehicle inventory. Names are bare ('inventory', not 'shop.inventory')
+     * because this group already prefixes shop. — naming them shop.* here would
+     * produce shop.shop.* and only break at route() call time.
+     */
+    Route::get('/inventory', [\App\Http\Controllers\Shop\InventoryController::class, 'index'])->name('inventory');
+    Route::get('/inventory/{vehicle}', [\App\Http\Controllers\Shop\InventoryController::class, 'show'])->name('vehicle');
+
+    Route::get('/products', [CatalogController::class, 'index'])->name('catalog');
+    Route::get('/search', [CatalogController::class, 'search'])->name('search');
+    Route::get('/collections', [CatalogController::class, 'collections'])->name('collections');
+    Route::get('/collections/{collection:slug}', [CatalogController::class, 'collection'])->name('collection');
+    Route::get('/products/{product:slug}', [CatalogController::class, 'product'])->name('product');
+
+    /*
+     * Help Center + policy pages (merchant-managed).
+     *
+     * /help/search is declared BEFORE /help/{category:slug} so the literal
+     * segment is not swallowed by the slug parameter. The article route is
+     * scopeBindings() so {article:slug} must belong to {category:slug}.
+     */
+    Route::get('/help', [\App\Http\Controllers\Shop\HelpController::class, 'index'])->name('help');
+    Route::get('/help/search', [\App\Http\Controllers\Shop\HelpController::class, 'search'])->name('help.search');
+    Route::get('/help/{category:slug}', [\App\Http\Controllers\Shop\HelpController::class, 'category'])->name('help.category');
+    Route::get('/help/{category:slug}/{article:slug}', [\App\Http\Controllers\Shop\HelpController::class, 'article'])
+        ->scopeBindings()->name('help.article');
+
+    Route::get('/pages/{page:slug}', [\App\Http\Controllers\Shop\PageController::class, 'show'])->name('page');
+
+    // Public API reference for this install (served by every deployment).
+    Route::get('/docs', [DocsController::class, 'index'])->name('docs');
+    Route::get('/docs/openapi.json', [DocsController::class, 'openapi'])->name('docs.openapi');
+
+    // Public inspection link: the customer opens this on their phone, sees the
+    // photos, and approves or declines each finding. No account, no password.
+    Route::get('/inspection/{token}', [\App\Http\Controllers\Shop\InspectionController::class, 'publicShow'])
+        ->name('inspection.public');
+    Route::get('/inspection/{token}/photo/{attachment}', [\App\Http\Controllers\Shop\InspectionController::class, 'photo'])
+        ->name('inspection.photo');
+    Route::post('/inspection/{token}/item/{item}/decide', [\App\Http\Controllers\Shop\InspectionController::class, 'decide'])
+        ->middleware('throttle:30,1')->name('inspection.decide');
+    Route::post('/inspection/{token}/approve-all', [\App\Http\Controllers\Shop\InspectionController::class, 'approveAll'])
+        ->middleware('throttle:10,1')->name('inspection.approve-all');
+
+    // Public quote link: an emailed quote can be reviewed, accepted, or declined
+    // via its unguessable accept_token, without an account.
+    Route::get('/quote/{token}', [ShopQuoteController::class, 'publicShow'])->name('quote.public');
+    Route::post('/quote/{token}/accept', [ShopQuoteController::class, 'publicAccept'])
+        ->middleware('throttle:10,1')->name('quote.public.accept');
+    Route::post('/quote/{token}/decline', [ShopQuoteController::class, 'publicDecline'])
+        ->middleware('throttle:10,1')->name('quote.public.decline');
+
+    // Request Service — the public intake front door. Captcha + throttle since
+    // it is an anonymous, mail-generating surface.
+    Route::get('/request', [ServiceRequestIntakeController::class, 'create'])->name('request');
+    Route::post('/request', [ServiceRequestIntakeController::class, 'store'])
+        ->middleware(['throttle:10,1', 'captcha:service_request'])->name('request.store');
+
+    // Public self-serve scheduling: a shareable page per booking type, plus a
+    // signed link that schedules an existing service request.
+    Route::get('/book/{bookingType:slug}', [BookingController::class, 'show'])->name('book');
+    Route::post('/book/{bookingType:slug}', [BookingController::class, 'store'])
+        ->middleware('throttle:10,1')->name('book.store');
+    Route::get('/schedule/{serviceRequest:number}', [BookingController::class, 'schedule'])
+        ->middleware('signed')->name('schedule');
+    Route::post('/schedule/{serviceRequest:number}', [BookingController::class, 'scheduleStore'])
+        ->middleware('throttle:10,1')->name('schedule.store');
+    Route::get('/scheduled/{serviceRequest:number}', [BookingController::class, 'scheduleDone'])->name('schedule.done');
+
+    // Manage an existing online booking via a signed link (reschedule / cancel).
+    Route::get('/booking/{workOrder:number}/manage', [BookingController::class, 'manage'])
+        ->middleware('signed')->name('booking.manage');
+    Route::post('/booking/{workOrder:number}/reschedule', [BookingController::class, 'reschedule'])
+        ->middleware(['signed', 'throttle:10,1'])->name('booking.reschedule');
+    Route::post('/booking/{workOrder:number}/cancel', [BookingController::class, 'cancel'])
+        ->middleware(['signed', 'throttle:10,1'])->name('booking.cancel');
+
+    // Cart.
+    Route::get('/cart', [CartController::class, 'show'])->name('cart');
+    Route::post('/cart', [CartController::class, 'add'])->name('cart.add');
+    Route::patch('/cart/items/{item}', [CartController::class, 'update'])->name('cart.update');
+    Route::delete('/cart/items/{item}', [CartController::class, 'remove'])->name('cart.remove');
+    Route::post('/cart/discount', [CartController::class, 'applyDiscount'])->name('cart.discount');
+    Route::delete('/cart/discount', [CartController::class, 'removeDiscount'])->name('cart.discount.remove');
+
+    // Checkout.
+    Route::get('/checkout', [CheckoutController::class, 'show'])->name('checkout');
+    Route::post('/checkout/quote', [CheckoutController::class, 'quote'])->name('checkout.quote');
+    Route::post('/checkout', [CheckoutController::class, 'place'])->middleware(['throttle:20,1', 'captcha:checkout'])->name('checkout.place');
+    /*
+     * Card step. Signed so a guest returns to their OWN payment page after a
+     * 3D Secure bounce without needing an account, while the order number in
+     * the path stays un-walkable by anyone who did not receive the link.
+     */
+    Route::get('/checkout/{order:number}/payment', [PaymentController::class, 'show'])
+        ->middleware('signed')->name('checkout.payment');
+
+    /*
+     * Stripe's return_url.
+     *
+     * ValidateSignature::except() is load-bearing: Stripe appends
+     * payment_intent, payment_intent_client_secret and redirect_status to the
+     * URL it redirects to, and a plain 'signed' middleware hashes the full query
+     * string, so every real return would 403. Those three parameters are
+     * excluded from the signature and are NOT read by the controller either: the
+     * outcome is re-fetched from the Stripe API, so appending
+     * redirect_status=succeeded by hand achieves nothing.
+     */
+    Route::get('/checkout/{order:number}/return', [PaymentController::class, 'return'])
+        ->middleware(ValidateSignature::absolute(['payment_intent', 'payment_intent_client_secret', 'redirect_status']))
+        ->name('checkout.return');
+
+    /*
+     * Authorize.Net on-site charge. Accept.js tokenises the card in the browser
+     * and posts ONLY the opaque nonce here; the amount is the order's server
+     * total, never the request. Signed, same as the card page.
+     */
+    Route::post('/checkout/{order:number}/authnet-charge', [PaymentController::class, 'authnetCharge'])
+        ->middleware('signed')->name('checkout.authnet-charge');
+
+    // Signed so a guest reaches their confirmation without an account, but the
+    // URL cannot be walked to read someone else's order.
+    Route::get('/orders/{order:number}/confirmation', [CheckoutController::class, 'confirmation'])
+        ->middleware('signed')->name('checkout.confirmation');
+
+    // Customer accounts (the 'customer' guard, never the staff one).
+    Route::middleware('guest:customer')->group(function () {
+        Route::get('/account/login', [AccountController::class, 'showLogin'])->name('account.login');
+        Route::post('/account/login', [AccountController::class, 'login'])->middleware(['throttle:10,1', 'captcha:account_login']);
+        Route::get('/account/register', [AccountController::class, 'showRegister'])->name('account.register');
+        Route::post('/account/register', [AccountController::class, 'register'])->middleware(['throttle:10,1', 'captcha:account_register']);
+        // Password reset. Both POSTs are captcha- and throttle-guarded: the
+        // forgot form is an email-enumeration / mail-flood surface, and the reset
+        // POST is a token-guessing surface.
+        Route::get('/account/forgot', [AccountController::class, 'showForgot'])->name('account.forgot');
+        Route::post('/account/forgot', [AccountController::class, 'sendResetLink'])->middleware(['throttle:10,1', 'captcha:account_forgot']);
+        Route::get('/account/reset/{token}', [AccountController::class, 'showReset'])->name('account.reset');
+        Route::post('/account/reset', [AccountController::class, 'reset'])->name('account.reset.update')->middleware(['throttle:10,1', 'captcha:account_forgot']);
+        // Customer demo personas. IP-gated inside the action and captcha-free,
+        // the storefront twin of the admin dev-login.
+        Route::post('/account/demo-login/{persona}', [AccountController::class, 'demoLogin'])
+            ->name('account.demo-login')->middleware('throttle:10,1');
+    });
+    Route::middleware('auth:customer')->group(function () {
+        Route::get('/account', [AccountController::class, 'index'])->name('account');
+        Route::get('/account/orders/{order:number}', [AccountController::class, 'order'])->name('account.order');
+        Route::get('/account/profile', [AccountController::class, 'profile'])->name('account.profile');
+        Route::put('/account/profile', [AccountController::class, 'updateProfile'])->name('account.profile.update');
+        Route::get('/account/addresses', [AccountController::class, 'addresses'])->name('account.addresses');
+        Route::post('/account/addresses', [AccountController::class, 'storeAddress'])->name('account.addresses.store');
+        Route::put('/account/addresses/{address}', [AccountController::class, 'updateAddress'])->name('account.addresses.update');
+        Route::delete('/account/addresses/{address}', [AccountController::class, 'destroyAddress'])->name('account.addresses.destroy');
+
+        // Service-desk portal: the customer's own requests, tickets, work
+        // orders and invoices. Every action re-checks ownership in the
+        // controller (customer_id === auth id -> 404), never trusting binding.
+        Route::get('/account/requests', [AccountController::class, 'requests'])->name('account.requests');
+        Route::get('/account/requests/{serviceRequest:number}', [AccountController::class, 'request'])->name('account.request');
+        Route::get('/account/tickets', [AccountController::class, 'tickets'])->name('account.tickets');
+        Route::get('/account/tickets/{ticket:number}', [AccountController::class, 'ticket'])->name('account.ticket');
+        Route::post('/account/tickets/{ticket:number}/reply', [AccountController::class, 'replyTicket'])
+            ->middleware('throttle:20,1')->name('account.ticket.reply');
+        Route::get('/account/work-orders', [AccountController::class, 'workOrders'])->name('account.work-orders');
+        Route::get('/account/work-orders/{workOrder:number}', [AccountController::class, 'workOrder'])->name('account.work-order');
+        Route::get('/account/work-orders/{workOrder:number}/calendar.ics', [AccountController::class, 'workOrderIcs'])->name('account.work-order.ics');
+        Route::post('/account/work-orders/{workOrder:number}/reschedule', [AccountController::class, 'rescheduleWorkOrder'])->name('account.work-order.reschedule');
+        Route::post('/account/work-orders/{workOrder:number}/cancel', [AccountController::class, 'cancelWorkOrder'])->name('account.work-order.cancel');
+        Route::get('/account/invoices', [AccountController::class, 'invoices'])->name('account.invoices');
+
+        Route::get('/account/quotes', [ShopQuoteController::class, 'index'])->name('account.quotes');
+        Route::get('/account/quotes/{quote:number}', [ShopQuoteController::class, 'show'])->name('account.quote');
+        Route::post('/account/quotes/{quote:number}/accept', [ShopQuoteController::class, 'accept'])->name('account.quote.accept');
+        Route::post('/account/quotes/{quote:number}/decline', [ShopQuoteController::class, 'decline'])->name('account.quote.decline');
+
+        Route::post('/account/logout', [AccountController::class, 'logout'])->name('account.logout');
+    });
+});
+
+/*
+|--------------------------------------------------------------------------
+| Merchant admin
+|--------------------------------------------------------------------------
+| Scaffold route NAMES are intentionally unprefixed (dashboard, settings.*,
+| products.*) so the inherited -MGR settings screens keep working verbatim.
+*/
+Route::prefix('admin')->middleware(['auth', 'security.policy'])->group(function () {
+    Route::get('/', DashboardController::class)->name('dashboard');
+
+    /* ---- Catalog ---- */
+    // Bulk routes are declared BEFORE the resource so /products/bulk is not
+    // swallowed by /products/{product}.
+    Route::delete('products/bulk', [ProductController::class, 'bulkDestroy'])->name('products.bulk-destroy');
+    Route::post('products/bulk-status', [ProductController::class, 'bulkStatus'])->name('products.bulk-status');
+    Route::resource('products', ProductController::class);
+    Route::post('products/{product}/duplicate', [ProductController::class, 'duplicate'])->name('products.duplicate');
+    Route::post('products/{product}/images', [ProductController::class, 'storeImage'])->name('products.images.store');
+    Route::delete('products/{product}/images/{image}', [ProductController::class, 'destroyImage'])->name('products.images.destroy');
+    Route::put('products/{product}/inventory', [ProductController::class, 'updateInventory'])->name('products.inventory.update');
+
+    Route::delete('collections/bulk', [CollectionController::class, 'bulkDestroy'])->name('collections.bulk-destroy');
+    Route::resource('collections', CollectionController::class);
+
+    /* ---- SEO health (catalog-level, not a settings screen) ---- */
+    Route::get('seo', [\App\Http\Controllers\Admin\SeoHealthController::class, 'index'])->name('seo.index');
+
+    /* ---- Orders ---- */
+    Route::delete('orders/bulk', [OrderController::class, 'bulkDestroy'])->name('orders.bulk-destroy');
+    Route::get('orders', [OrderController::class, 'index'])->name('orders.index');
+    Route::get('orders/{order}', [OrderController::class, 'show'])->name('orders.show');
+    Route::post('orders/{order}/fulfill', [OrderController::class, 'fulfill'])->name('orders.fulfill');
+    Route::post('orders/{order}/pay', [OrderController::class, 'markPaid'])->name('orders.pay');
+    Route::post('orders/{order}/refund', [OrderController::class, 'refund'])->name('orders.refund');
+    Route::post('orders/{order}/resend-email', [OrderController::class, 'resendEmail'])->name('orders.resend-email');
+    Route::post('orders/{order}/cancel', [OrderController::class, 'cancel'])->name('orders.cancel');
+    Route::post('orders/{order}/note', [OrderController::class, 'note'])->name('orders.note');
+
+    /* ---- Service Desk: intake requests ---- */
+    Route::delete('service-requests/bulk', [ServiceRequestController::class, 'bulkDestroy'])->name('service-requests.bulk-destroy');
+    Route::get('service-requests', [ServiceRequestController::class, 'index'])->name('service-requests.index');
+    Route::get('service-requests/{serviceRequest}', [ServiceRequestController::class, 'show'])->name('service-requests.show');
+    Route::post('service-requests/{serviceRequest}/convert-ticket', [ServiceRequestController::class, 'convertToTicket'])->name('service-requests.convert-ticket');
+    Route::post('service-requests/{serviceRequest}/convert-work-order', [ServiceRequestController::class, 'convertToWorkOrder'])->name('service-requests.convert-work-order');
+    Route::post('service-requests/{serviceRequest}/convert-quote', [ServiceRequestController::class, 'convertToQuote'])->name('service-requests.convert-quote');
+    Route::post('service-requests/{serviceRequest}/close', [ServiceRequestController::class, 'close'])->name('service-requests.close');
+
+    /* ---- Service Desk: tickets ---- */
+    Route::delete('tickets/bulk', [TicketController::class, 'bulkDestroy'])->name('tickets.bulk-destroy');
+    Route::get('tickets', [TicketController::class, 'index'])->name('tickets.index');
+    Route::get('tickets/{ticket}', [TicketController::class, 'show'])->name('tickets.show');
+    Route::post('tickets/{ticket}/reply', [TicketController::class, 'reply'])->name('tickets.reply');
+    Route::post('tickets/{ticket}/status', [TicketController::class, 'status'])->name('tickets.status');
+    Route::post('tickets/{ticket}/assign', [TicketController::class, 'assign'])->name('tickets.assign');
+    Route::post('tickets/{ticket}/work-order', [TicketController::class, 'workOrder'])->name('tickets.work-order');
+    Route::delete('tickets/{ticket}', [TicketController::class, 'destroy'])->name('tickets.destroy');
+
+    /* ---- Service Desk: work orders ---- */
+    Route::delete('work-orders/bulk', [WorkOrderController::class, 'bulkDestroy'])->name('work-orders.bulk-destroy');
+    Route::post('work-orders/{workOrder}/status', [WorkOrderController::class, 'status'])->name('work-orders.status');
+    Route::post('work-orders/{workOrder}/complete', [WorkOrderController::class, 'complete'])->name('work-orders.complete');
+    Route::post('work-orders/{workOrder}/cancel', [WorkOrderController::class, 'cancel'])->name('work-orders.cancel');
+    Route::resource('work-orders', WorkOrderController::class)->parameters(['work-orders' => 'workOrder']);
+
+    /* ---- Service Desk: quotes / estimates ---- */
+    Route::delete('quotes/bulk', [QuoteController::class, 'bulkDestroy'])->name('quotes.bulk-destroy');
+    Route::post('quotes/{quote}/send', [QuoteController::class, 'send'])->name('quotes.send');
+    Route::post('quotes/{quote}/accept', [QuoteController::class, 'accept'])->name('quotes.accept');
+    Route::post('quotes/{quote}/decline', [QuoteController::class, 'decline'])->name('quotes.decline');
+    Route::post('quotes/{quote}/convert', [QuoteController::class, 'convert'])->name('quotes.convert');
+    Route::resource('quotes', QuoteController::class);
+
+    /* ---- Service Desk: projects ---- */
+    Route::delete('projects/bulk', [ProjectController::class, 'bulkDestroy'])->name('projects.bulk-destroy');
+    Route::post('projects/{project}/status', [ProjectController::class, 'status'])->name('projects.status');
+    Route::resource('projects', ProjectController::class);
+
+    /* ---- Shop: canned jobs and service reminders ---- */
+    Route::resource('canned-jobs', CannedJobController::class)->except(['show'])->parameters(['canned-jobs' => 'cannedJob']);
+    Route::post('reminders/{reminder}/complete', [ServiceReminderController::class, 'complete'])->name('reminders.complete');
+    Route::post('reminders/{reminder}/dismiss', [ServiceReminderController::class, 'dismiss'])->name('reminders.dismiss');
+    Route::resource('reminders', ServiceReminderController::class)->except(['show']);
+
+    /* ---- Shop: digital vehicle inspections ---- */
+    Route::post('inspections/{inspection}/send', [InspectionController::class, 'send'])->name('inspections.send');
+    Route::post('inspections/{inspection}/close', [InspectionController::class, 'close'])->name('inspections.close');
+    Route::post('inspections/{inspection}/bill', [InspectionController::class, 'bill'])->name('inspections.bill');
+    Route::post('inspections/{inspection}/items/{item}/photos', [InspectionController::class, 'uploadPhoto'])->name('inspections.photos.store');
+    Route::delete('inspections/{inspection}/items/{item}/photos/{attachment}', [InspectionController::class, 'destroyPhoto'])->name('inspections.photos.destroy');
+    Route::get('inspections/{inspection}/photo/{attachment}', [InspectionController::class, 'photo'])->name('inspections.photo');
+    Route::resource('inspections', InspectionController::class);
+
+    /* ---- Shop: parts, suppliers, purchasing, and the clock ---- */
+    Route::post('parts/{part}/adjust', [\App\Http\Controllers\Admin\PartController::class, 'adjust'])->name('parts.adjust');
+    Route::resource('parts', \App\Http\Controllers\Admin\PartController::class);
+    Route::resource('suppliers', \App\Http\Controllers\Admin\SupplierController::class);
+
+    Route::post('purchase-orders/{purchaseOrder}/place', [\App\Http\Controllers\Admin\PurchaseOrderController::class, 'place'])->name('purchase-orders.place');
+    Route::post('purchase-orders/{purchaseOrder}/receive', [\App\Http\Controllers\Admin\PurchaseOrderController::class, 'receive'])->name('purchase-orders.receive');
+    Route::resource('purchase-orders', \App\Http\Controllers\Admin\PurchaseOrderController::class)->except(['edit', 'update']);
+
+    Route::get('time', [\App\Http\Controllers\Admin\TimeClockController::class, 'index'])->name('time.index');
+    Route::post('time/clock-on', [\App\Http\Controllers\Admin\TimeClockController::class, 'clockOn'])->name('time.clock-on');
+    Route::post('time/{entry}/clock-off', [\App\Http\Controllers\Admin\TimeClockController::class, 'clockOff'])->name('time.clock-off');
+
+    Route::post('work-orders/{workOrder}/parts', [WorkOrderController::class, 'issuePart'])->name('work-orders.parts.issue');
+    Route::delete('work-orders/{workOrder}/parts/{item}', [WorkOrderController::class, 'returnPart'])->name('work-orders.parts.return');
+
+    /* ---- Shop: vehicles. The object a repair shop actually works on. ---- */
+    Route::delete('vehicles/bulk', [VehicleController::class, 'bulkDestroy'])->name('vehicles.bulk-destroy');
+    Route::resource('vehicles', VehicleController::class);
+
+    /* ---- Scheduling: booking types ---- */
+    Route::delete('booking-types/bulk', [BookingTypeController::class, 'bulkDestroy'])->name('booking-types.bulk-destroy');
+    Route::resource('booking-types', BookingTypeController::class)->parameters(['booking-types' => 'bookingType']);
+
+    /* ---- Scheduling: per-staff availability ---- */
+    Route::get('availability', [AvailabilityController::class, 'index'])->name('availability.index');
+    Route::get('availability/{user}', [AvailabilityController::class, 'edit'])->name('availability.edit');
+    Route::put('availability/{user}', [AvailabilityController::class, 'update'])->name('availability.update');
+
+    /* ---- My Calendar: per-staff calendar connections + sync ---- */
+    Route::get('calendar', [CalendarConnectionController::class, 'index'])->name('calendar.index');
+    Route::get('calendar/connect/{provider}', [CalendarConnectionController::class, 'connect'])->name('calendar.connect');
+    Route::get('calendar/callback/{provider}', [CalendarConnectionController::class, 'callback'])->name('calendar.callback');
+    Route::post('calendar/apple', [CalendarConnectionController::class, 'connectApple'])->name('calendar.apple');
+    Route::delete('calendar/connections/{connection}', [CalendarConnectionController::class, 'disconnect'])->name('calendar.disconnect');
+    Route::post('calendar/sync', [CalendarConnectionController::class, 'sync'])->name('calendar.sync');
+    Route::get('work-orders/{workOrder}/calendar.ics', [CalendarFeedController::class, 'workOrderIcs'])->name('work-orders.ics');
+
+    /* ---- Customers ---- */
+    Route::delete('customers/bulk', [CustomerController::class, 'bulkDestroy'])->name('customers.bulk-destroy');
+    Route::resource('customers', CustomerController::class)->except(['create', 'store']);
+
+    /* ---- Discounts ---- */
+    Route::delete('discounts/bulk', [DiscountController::class, 'bulkDestroy'])->name('discounts.bulk-destroy');
+    Route::resource('discounts', DiscountController::class);
+
+    /* ---- Help Center (categories + articles) and policy pages ---- */
+    Route::delete('help-categories/bulk', [\App\Http\Controllers\Admin\HelpCategoryController::class, 'bulkDestroy'])->name('help-categories.bulk-destroy');
+    Route::resource('help-categories', \App\Http\Controllers\Admin\HelpCategoryController::class)->except('show');
+    Route::delete('help-articles/bulk', [\App\Http\Controllers\Admin\HelpArticleController::class, 'bulkDestroy'])->name('help-articles.bulk-destroy');
+    Route::resource('help-articles', \App\Http\Controllers\Admin\HelpArticleController::class)->except('show');
+    Route::delete('store-pages/bulk', [\App\Http\Controllers\Admin\StorePageController::class, 'bulkDestroy'])->name('store-pages.bulk-destroy');
+    Route::resource('store-pages', \App\Http\Controllers\Admin\StorePageController::class)->except('show');
+
+    /* ---- Shipping (zones + their rates) ---- */
+    Route::delete('shipping/bulk', [ShippingController::class, 'bulkDestroy'])->name('shipping.bulk-destroy');
+    Route::get('shipping', [ShippingController::class, 'index'])->name('shipping.index');
+    Route::get('shipping/create', [ShippingController::class, 'create'])->name('shipping.create');
+    Route::post('shipping', [ShippingController::class, 'store'])->name('shipping.store');
+    Route::get('shipping/{zone}/edit', [ShippingController::class, 'edit'])->name('shipping.edit');
+    Route::put('shipping/{zone}', [ShippingController::class, 'update'])->name('shipping.update');
+    Route::delete('shipping/{zone}', [ShippingController::class, 'destroy'])->name('shipping.destroy');
+    Route::post('shipping/{zone}/rates', [ShippingController::class, 'storeRate'])->name('shipping.rates.store');
+    Route::put('shipping/rates/{rate}', [ShippingController::class, 'updateRate'])->name('shipping.rates.update');
+    Route::delete('shipping/rates/{rate}', [ShippingController::class, 'destroyRate'])->name('shipping.rates.destroy');
+
+    /* ---- Tax ---- */
+    Route::delete('taxes/bulk', [TaxController::class, 'bulkDestroy'])->name('taxes.bulk-destroy');
+    Route::resource('taxes', TaxController::class)->parameters(['taxes' => 'taxRule']);
+
+    /* ---- Appearance: themes + templates -------------------------------
+    | Themes restyle the storefront from stored design tokens; templates let
+    | an admin edit the real Blade behind any page. Bulk and preview routes are
+    | declared before the {theme} / {view} routes so they are not swallowed by
+    | the parameter segment.
+    */
+    Route::get('appearance/themes', [ThemeController::class, 'index'])->name('themes.index');
+    Route::get('appearance/themes/create', [ThemeController::class, 'create'])->name('themes.create');
+    Route::post('appearance/themes', [ThemeController::class, 'store'])->name('themes.store');
+    Route::post('appearance/themes/import', [ThemeController::class, 'import'])->name('themes.import');
+    Route::delete('appearance/themes/bulk', [ThemeController::class, 'bulkDestroy'])->name('themes.bulk-destroy');
+    Route::post('appearance/themes/preview/stop', [ThemeController::class, 'stopPreview'])->name('themes.preview.stop');
+    Route::get('appearance/themes/{theme}/edit', [ThemeController::class, 'edit'])->name('themes.edit');
+    Route::put('appearance/themes/{theme}', [ThemeController::class, 'update'])->name('themes.update');
+    Route::delete('appearance/themes/{theme}', [ThemeController::class, 'destroy'])->name('themes.destroy');
+    Route::post('appearance/themes/{theme}/activate', [ThemeController::class, 'activate'])->name('themes.activate');
+    Route::post('appearance/themes/{theme}/preview', [ThemeController::class, 'preview'])->name('themes.preview');
+    Route::post('appearance/themes/{theme}/duplicate', [ThemeController::class, 'duplicate'])->name('themes.duplicate');
+    Route::get('appearance/themes/{theme}/export', [ThemeController::class, 'export'])->name('themes.export');
+
+    Route::get('appearance/templates', [TemplateController::class, 'index'])->name('templates.index');
+    Route::post('appearance/templates/preview/stop', [TemplateController::class, 'stopPreview'])->name('templates.preview.stop');
+    Route::get('appearance/templates/{view}', [TemplateController::class, 'edit'])->name('templates.edit')->where('view', '[A-Za-z0-9._-]+');
+    Route::put('appearance/templates/{view}', [TemplateController::class, 'update'])->name('templates.update')->where('view', '[A-Za-z0-9._-]+');
+    Route::delete('appearance/templates/{view}', [TemplateController::class, 'reset'])->name('templates.reset')->where('view', '[A-Za-z0-9._-]+');
+    Route::post('appearance/templates/{view}/preview', [TemplateController::class, 'preview'])->name('templates.preview')->where('view', '[A-Za-z0-9._-]+');
+    Route::get('appearance/templates/{view}/versions/{version}', [TemplateController::class, 'version'])->name('templates.version')->where('view', '[A-Za-z0-9._-]+');
+    Route::post('appearance/templates/{view}/versions/{version}/revert', [TemplateController::class, 'revert'])->name('templates.revert')->where('view', '[A-Za-z0-9._-]+');
+
+    /* ---- Settings: store-specific ---- */
+    Route::view('/settings', 'settings.index')->name('settings.index');
+    Route::get('settings/storefront', [StorefrontSettingsController::class, 'edit'])->name('settings.storefront.edit');
+    Route::put('settings/storefront', [StorefrontSettingsController::class, 'update'])->name('settings.storefront.update');
+    Route::get('settings/payments', [PaymentSettingsController::class, 'edit'])->name('settings.payments.edit');
+    Route::put('settings/payments', [PaymentSettingsController::class, 'update'])->name('settings.payments.update');
+    Route::post('settings/payments/test', [PaymentSettingsController::class, 'test'])->name('settings.payments.test');
+    Route::post('settings/payments/test-authnet', [PaymentSettingsController::class, 'testAuthnet'])->name('settings.payments.test-authnet');
+
+    /* ---- Calendar sync provider configuration ---- */
+    Route::get('settings/calendar', [CalendarSettingsController::class, 'edit'])->name('settings.calendar.edit');
+    Route::put('settings/calendar', [CalendarSettingsController::class, 'update'])->name('settings.calendar.update');
+    Route::post('settings/calendar/test/{provider}', [CalendarSettingsController::class, 'test'])->name('settings.calendar.test');
+    Route::get('settings/seo', [\App\Http\Controllers\Admin\SeoSettingsController::class, 'edit'])->name('settings.seo.edit');
+    Route::put('settings/seo', [\App\Http\Controllers\Admin\SeoSettingsController::class, 'update'])->name('settings.seo.update');
+    Route::get('settings/spam', [SpamProtectionController::class, 'edit'])->name('settings.spam.edit');
+    Route::put('settings/spam', [SpamProtectionController::class, 'update'])->name('settings.spam.update');
+    Route::post('settings/spam/test', [SpamProtectionController::class, 'test'])->name('settings.spam.test');
+
+    /* ---- Settings: inherited -MGR scaffold ---- */
+    Route::get('settings/tokens', [ApiTokenController::class, 'index'])->name('settings.tokens.index');
+    Route::post('settings/tokens', [ApiTokenController::class, 'store'])->name('settings.tokens.store');
+    Route::delete('settings/tokens/{apiToken}', [ApiTokenController::class, 'destroy'])->name('settings.tokens.destroy');
+    Route::get('settings/password', [PasswordController::class, 'edit'])->name('settings.password.edit');
+    Route::put('settings/password', [PasswordController::class, 'update'])->name('settings.password.update');
+    Route::get('settings/license', [\App\Http\Controllers\LicenseController::class, 'edit'])->name('settings.license.edit');
+    Route::put('settings/license', [\App\Http\Controllers\LicenseController::class, 'update'])->name('settings.license.update');
+    Route::post('settings/license/sync', [\App\Http\Controllers\LicenseController::class, 'sync'])->name('settings.license.sync');
+    Route::get('settings/branding', [BrandingController::class, 'edit'])->name('settings.branding.edit');
+    Route::put('settings/branding', [BrandingController::class, 'update'])->name('settings.branding.update');
+    Route::get('settings/2fa', [TwoFactorController::class, 'show'])->name('settings.2fa.show');
+    Route::post('settings/2fa/enable', [TwoFactorController::class, 'enable'])->name('settings.2fa.enable');
+    Route::post('settings/2fa/confirm', [TwoFactorController::class, 'confirm'])->name('settings.2fa.confirm');
+    Route::delete('settings/2fa', [TwoFactorController::class, 'disable'])->name('settings.2fa.disable');
+    Route::get('settings/notifications', [NotificationController::class, 'edit'])->name('settings.notifications.edit');
+    Route::put('settings/notifications', [NotificationController::class, 'update'])->name('settings.notifications.update');
+    Route::post('settings/notifications/test', [NotificationController::class, 'test'])->name('settings.notifications.test');
+    Route::get('settings/users', [UserController::class, 'index'])->name('settings.users.index');
+    Route::get('settings/users/create', [UserController::class, 'create'])->name('settings.users.create');
+    Route::post('settings/users', [UserController::class, 'store'])->name('settings.users.store');
+    Route::get('settings/users/{user}/edit', [UserController::class, 'edit'])->name('settings.users.edit');
+    Route::put('settings/users/{user}', [UserController::class, 'update'])->name('settings.users.update');
+    Route::delete('settings/users/{user}', [UserController::class, 'destroy'])->name('settings.users.destroy');
+    Route::get('settings/audit', [AuditLogController::class, 'index'])->name('settings.audit.index');
+    Route::delete('settings/audit/selected', [AuditLogController::class, 'destroySelected'])->name('settings.audit.destroy-selected');
+    Route::delete('settings/audit/all', [AuditLogController::class, 'destroyAll'])->name('settings.audit.destroy-all');
+    Route::get('settings/general', [GeneralSettingsController::class, 'edit'])->name('settings.general.edit');
+    Route::put('settings/general', [GeneralSettingsController::class, 'update'])->name('settings.general.update');
+
+    Route::get('settings/firewall', [FirewallController::class, 'index'])->name('settings.firewall.index');
+    Route::put('settings/firewall', [FirewallController::class, 'update'])->name('settings.firewall.update');
+    Route::post('settings/firewall/bans', [FirewallController::class, 'ban'])->name('settings.firewall.ban');
+    Route::delete('settings/firewall/bans/{bannedIp}', [FirewallController::class, 'unban'])->name('settings.firewall.unban');
+    Route::delete('settings/firewall/sessions/{id}', [FirewallController::class, 'revokeSession'])->name('settings.firewall.session.revoke');
+    Route::post('settings/firewall/sessions/bulk', [FirewallController::class, 'bulkSessions'])->name('settings.firewall.sessions.bulk');
+    Route::post('settings/firewall/bulk', [FirewallController::class, 'bulk'])->name('settings.firewall.bulk');
+
+    Route::get('settings/host', [HostSslController::class, 'edit'])->name('settings.host.edit');
+    Route::put('settings/host', [HostSslController::class, 'update'])->name('settings.host.update');
+    Route::post('settings/host/letsencrypt', [HostSslController::class, 'letsencrypt'])->name('settings.host.letsencrypt');
+    Route::post('settings/host/upload', [HostSslController::class, 'upload'])->name('settings.host.upload');
+    Route::post('settings/host/self-signed', [HostSslController::class, 'selfSigned'])->name('settings.host.self-signed');
+
+    Route::get('settings/integrations', [\App\Http\Controllers\IntegrationController::class, 'edit'])->name('settings.integrations.edit');
+    Route::put('settings/integrations', [\App\Http\Controllers\IntegrationController::class, 'update'])->name('settings.integrations.update');
+    Route::post('settings/integrations/test', [\App\Http\Controllers\IntegrationController::class, 'test'])->name('settings.integrations.test');
+
+    Route::get('settings/backup', [\App\Http\Controllers\BackupController::class, 'index'])->name('settings.backup.index');
+    Route::get('settings/backup/config', [\App\Http\Controllers\BackupController::class, 'downloadConfig'])->name('settings.backup.config');
+    Route::get('settings/backup/database', [\App\Http\Controllers\BackupController::class, 'downloadDatabase'])->name('settings.backup.database');
+    Route::post('settings/backup/restore', [\App\Http\Controllers\BackupController::class, 'restore'])->name('settings.backup.restore');
+    Route::put('settings/backup/schedule', [\App\Http\Controllers\BackupController::class, 'saveSchedule'])->name('settings.backup.schedule');
+    Route::post('settings/backup/run', [\App\Http\Controllers\BackupController::class, 'runNow'])->name('settings.backup.run');
+
+    Route::get('settings/updates', [\App\Http\Controllers\UpdateController::class, 'show'])->name('settings.updates.show');
+    Route::post('settings/updates/check', [\App\Http\Controllers\UpdateController::class, 'check'])->name('settings.updates.check');
+    Route::post('settings/updates/apply', [\App\Http\Controllers\UpdateController::class, 'apply'])->name('settings.updates.apply');
+    Route::post('settings/updates/auto', [\App\Http\Controllers\UpdateController::class, 'toggleAuto'])->name('settings.updates.auto');
+});
